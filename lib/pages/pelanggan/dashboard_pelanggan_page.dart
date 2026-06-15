@@ -1,9 +1,100 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:pamdes/services/fcm_service.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'package:timezone/data/latest.dart' as tz;
 import '../../layout/pelanggan_scaffold.dart';
 import 'package:pamdes/services/api_service.dart';
+import 'package:pamdes/services/notification_service.dart';
 
+// ── NOTIFICATION SERVICE ──────────────────────────────────────
+class NotificationService {
+  static final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+
+  static Future<void> init() async {
+    tz.initializeTimeZones();
+
+    const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const ios = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
+
+    await _plugin.initialize(
+      const InitializationSettings(android: android, iOS: ios),
+    );
+
+    await _plugin
+        .resolvePlatformSpecificImplementation
+            <AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+  }
+
+  static Future<void> tampilSekarang({
+    required int id,
+    required String judul,
+    required String pesan,
+  }) async {
+    const detail = NotificationDetails(
+      android: AndroidNotificationDetails(
+        'pamdes_channel',
+        'PAMDes Notifikasi',
+        channelDescription: 'Notifikasi tagihan PAMDes',
+        importance: Importance.high,
+        priority: Priority.high,
+        icon: '@mipmap/ic_launcher',
+      ),
+      iOS: DarwinNotificationDetails(),
+    );
+    await _plugin.show(id, judul, pesan, detail);
+  }
+
+  static Future<void> jadwalkanPengingat({
+    required int id,
+    required String judul,
+    required String pesan,
+    required DateTime jatuhTempo,
+  }) async {
+    await _plugin.cancel(id);
+
+    final hMinus3  = jatuhTempo.subtract(const Duration(days: 3));
+    final sekarang = DateTime.now();
+
+    if (hMinus3.isAfter(sekarang)) {
+      const detail = NotificationDetails(
+        android: AndroidNotificationDetails(
+          'pamdes_reminder_channel',
+          'PAMDes Pengingat Tagihan',
+          channelDescription: 'Pengingat jatuh tempo tagihan PAMDes',
+          importance: Importance.max,
+          priority: Priority.high,
+          icon: '@mipmap/ic_launcher',
+        ),
+        iOS: DarwinNotificationDetails(),
+      );
+
+      await _plugin.zonedSchedule(
+        id,
+        judul,
+        pesan,
+        tz.TZDateTime.from(hMinus3, tz.local),
+        detail,
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation:
+            UILocalNotificationDateInterpretation.absoluteTime,
+      );
+    }
+  }
+
+  static Future<void> batalkanSemua() async => _plugin.cancelAll();
+}
+
+// ── DASHBOARD ─────────────────────────────────────────────────
 class DashboardPelangganPage extends StatefulWidget {
   const DashboardPelangganPage({super.key});
 
@@ -12,26 +103,36 @@ class DashboardPelangganPage extends StatefulWidget {
 }
 
 class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
-  bool _loading = true;
-  String _error = '';
+  bool _loading            = true;
+  String _error            = '';
   Map<String, dynamic> _tagihan = {};
-  List _riwayat = [];
-  String _nama = '';
-  bool _showPilihanBayar = false;
+  List _riwayat            = [];
+  String _nama             = '';
+  bool _showPilihanBayar   = false;
   bool _menungguKonfirmasi = false;
-  bool _prosesLoading = false;
+  bool _prosesLoading      = false;
+  bool _sudahNotifLunas    = false;
+  Timer? _pollingTimer;
 
   @override
   void initState() {
     super.initState();
+    NotificationService.init(); // init local notification
+    FCMService.init();          // init FCM ← tambahan
     _loadData();
   }
 
-  // Mengubah return type menjadi Future<void> agar bisa dipakai di RefreshIndicator
+  @override
+  void dispose() {
+    _pollingTimer?.cancel();
+    super.dispose();
+  }
+
   Future<void> _loadData() async {
     setState(() {
-      _showPilihanBayar   = false;
-      _menungguKonfirmasi = false;
+      _showPilihanBayar    = false;
+      _menungguKonfirmasi  = false;
+      _sudahNotifLunas     = false;
     });
     try {
       final result = await ApiService.getDashboardPelanggan();
@@ -50,11 +151,82 @@ class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
           _menungguKonfirmasi = true;
         }
       });
+
+      _handleNotifikasiTagihan();
+
+      // Kalau saat buka app statusnya masih menunggu, langsung polling
+      if (_menungguKonfirmasi) {
+        _mulaiPolling();
+      }
     } catch (e) {
       setState(() {
         _error   = 'Gagal memuat data';
         _loading = false;
       });
+    }
+  }
+
+  // ── POLLING ───────────────────────────────────────────────
+  void _mulaiPolling() {
+    _pollingTimer?.cancel();
+    _pollingTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+      if (!mounted) return;
+
+      if (!_menungguKonfirmasi) {
+        _pollingTimer?.cancel();
+        return;
+      }
+
+      try {
+        final result = await ApiService.getDashboardPelanggan();
+        final status = result['tagihan']?['status'] as String?;
+
+        if (status == 'Lunas') {
+          _pollingTimer?.cancel();
+          if (mounted) _loadData();
+        }
+      } catch (_) {
+        // Gagal polling, coba lagi interval berikutnya
+      }
+    });
+  }
+
+  // ── NOTIFIKASI ────────────────────────────────────────────
+  void _handleNotifikasiTagihan() {
+    if (_tagihan.isEmpty) return;
+
+    final status     = _tagihan['status'] as String?;
+    final tanggalStr = _tagihan['tanggal'] as String?;
+    final harga      = _formatRupiah(_tagihan['harga']);
+
+    if (status == 'Belum Lunas') {
+      NotificationService.tampilSekarang(
+        id: 1,
+        judul: '⚠️ Tagihan Belum Lunas',
+        pesan: 'Kamu memiliki tagihan sebesar $harga. Segera bayar sebelum jatuh tempo!',
+      );
+    }
+
+    if (tanggalStr != null && tanggalStr != '-') {
+      try {
+        final jatuhTempo = DateFormat('dd-MM-yyyy').parse(tanggalStr);
+        NotificationService.jadwalkanPengingat(
+          id: 2,
+          judul: '🔔 Pengingat Jatuh Tempo',
+          pesan: 'Tagihan air sebesar $harga jatuh tempo pada $tanggalStr. Jangan lupa bayar!',
+          jatuhTempo: jatuhTempo,
+        );
+      } catch (_) {}
+    }
+
+    if (status == 'Lunas' && !_sudahNotifLunas) {
+      _sudahNotifLunas = true;
+      NotificationService.tampilSekarang(
+        id: 4,
+        judul: '🎉 Pembayaran Lunas!',
+        pesan: 'Tagihan air sebesar $harga telah dikonfirmasi lunas. Terima kasih!',
+      );
+      NotificationService.batalkanSemua();
     }
   }
 
@@ -71,10 +243,16 @@ class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
       if (result['success'] == true) {
         if (method == 'Tunai') {
           setState(() {
-            _showPilihanBayar   = false;
-            _menungguKonfirmasi = true;
-            _prosesLoading      = false;
+            _showPilihanBayar    = false;
+            _menungguKonfirmasi  = true;
+            _prosesLoading       = false;
           });
+          NotificationService.tampilSekarang(
+            id: 3,
+            judul: '✅ Pembayaran Dikirim',
+            pesan: 'Pembayaran tunaimu sedang menunggu konfirmasi admin.',
+          );
+          _mulaiPolling(); // ← mulai polling setelah bayar tunai
         } else {
           final redirectUrl = result['redirect'];
           setState(() => _prosesLoading = false);
@@ -127,17 +305,14 @@ class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
   @override
   Widget build(BuildContext context) {
     return PelangganScaffold(
-      // 1. Tambahkan RefreshIndicator di sini
       child: RefreshIndicator(
-        onRefresh: _loadData, // Fungsi yang dipanggil saat ditarik ke bawah
+        onRefresh: _loadData,
         color: const Color(0xff0d7db8),
         child: SingleChildScrollView(
-          // 2. physics dicustom agar scroll tetep membal/bisa ditarik walaupun datanya sedikit
           physics: const AlwaysScrollableScrollPhysics(),
           child: ConstrainedBox(
-            // 3. Memaksa isi container minimal seukuran layar perangkat agar trigger swipe-nya aktif
             constraints: BoxConstraints(
-              minHeight: MediaQuery.of(context).size.height - 100, 
+              minHeight: MediaQuery.of(context).size.height - 100,
             ),
             child: Padding(
               padding: const EdgeInsets.all(24),
@@ -154,19 +329,14 @@ class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
                       ),
                     ),
                   const SizedBox(height: 16),
-
                   if (_loading)
                     const Padding(
                       padding: EdgeInsets.only(top: 40),
                       child: Center(child: CircularProgressIndicator()),
                     ),
-
                   if (!_loading && _error.isNotEmpty)
                     Text(_error, style: const TextStyle(color: Colors.red)),
-
                   if (!_loading && _error.isEmpty) ...[
-
-                    // TAGIHAN AKTIF
                     _Card(
                       child: _tagihan.isEmpty
                         ? const _InfoSection(
@@ -208,8 +378,6 @@ class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
                               _TagihanRow('Meteran',     '${_tagihan['meteran'] ?? '-'} m³'),
                               _TagihanRow('Metode',      _tagihan['metode_pembayaran'] ?? '-'),
                               const SizedBox(height: 16),
-
-                              // TOMBOL BAYAR — hanya muncul kalau Belum Lunas
                               if (!_menungguKonfirmasi &&
                                   !_showPilihanBayar &&
                                   _tagihan['status'] == 'Belum Lunas')
@@ -228,8 +396,6 @@ class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
                                     ),
                                   ),
                                 ),
-
-                              // PILIHAN TUNAI / NON TUNAI
                               if (_showPilihanBayar && !_menungguKonfirmasi) ...[
                                 const Text(
                                   'Pilih metode pembayaran:',
@@ -268,8 +434,6 @@ class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
                                       ],
                                     ),
                               ],
-
-                              // PESAN MENUNGGU
                               if (_menungguKonfirmasi)
                                 Container(
                                   width: double.infinity,
@@ -301,8 +465,6 @@ class _DashboardPelangganPageState extends State<DashboardPelangganPage> {
                           ),
                     ),
                     const SizedBox(height: 16),
-
-                    // RIWAYAT
                     _Card(
                       child: _riwayat.isEmpty
                         ? const _InfoSection(
@@ -414,7 +576,7 @@ class _MidtransWebViewPageState extends State<MidtransWebViewPage> {
         backgroundColor: const Color(0xff0d7db8),
         foregroundColor: Colors.white,
         leading: IconButton(
-          icon: const Icon(IconData(0xe16a, fontFamily: 'MaterialIcons')), // Menggantikan Icons.close agar aman dari masalah font
+          icon: const Icon(IconData(0xe16a, fontFamily: 'MaterialIcons')),
           onPressed: widget.onSelesai,
         ),
       ),

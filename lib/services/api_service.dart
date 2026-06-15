@@ -122,6 +122,18 @@ class ApiService {
     // Mengembalikan data berupa Map Object {}
     return data is Map<String, dynamic> ? data : {};
   }
+  
+  static Future<void> simpanFcmToken(String fcmToken) async {
+    try {
+      await http.post(
+        Uri.parse('$baseUrl/fcm-token'),
+        headers: headers, // ← pakai headers yang sudah ada, sudah include Authorization
+        body: jsonEncode({'token': fcmToken}),
+      );
+    } catch (e) {
+      print('Gagal simpan FCM token: $e');
+    }
+  }
 
 
 }

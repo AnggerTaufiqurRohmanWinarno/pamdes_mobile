@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "792865941370",
+    "project_id": "pamdes-af0b4",
+    "storage_bucket": "pamdes-af0b4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:792865941370:android:ddc4aaefe5c7f1558a18c3",
+        "android_client_info": {
+          "package_name": "com.example.pamdes"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC3IbYk_j9-3-gsN4_h98tch4OzRfjXmgQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
